@@ -1,5 +1,5 @@
 #==========================================================================
-# Description: Build Armbian arm64 server image
+# Description: Build Armbian arm64 server image (Optimized for hk1-rbox-k8s)
 # Copyright (C) 2021 https://github.com/ophub/amlogic-s9xxx-armbian
 #==========================================================================
 
@@ -15,15 +15,14 @@ on:
         default: "bookworm"
         type: choice
         options:
-          - all
-          - trixie
           - bookworm
+          - trixie
           - resolute
           - noble
       armbian_board:
         description: "Select device board."
         required: false
-        default: "amlogic"
+        default: "hk1-rbox-k8s"
         type: choice
         options:
           - hk1-rbox-k8s
@@ -33,17 +32,11 @@ on:
         default: "6.12.y"
         type: choice
         options:
-          - 5.10.y
-          - 5.15.y
+          - 6.12.y
           - 6.1.y
           - 6.6.y
-          - 6.12.y
           - 6.18.y
-          - 5.10.y_5.15.y
-          - 6.1.y_6.6.y
           - 6.12.y_6.18.y
-          - 6.1.y_6.12.y
-          - 6.1.y_6.18.y
       kernel_repo:
         description: "Set the kernel repository."
         required: false
@@ -76,7 +69,6 @@ on:
         options:
           - server
           - desktop
-          - beta
       builder_name:
         description: "Set Armbian builder signature."
         required: false
@@ -84,7 +76,6 @@ on:
         type: choice
         options:
           - ophub
-          - angel
       config_board:
         description: "Set the base Armbian board name."
         required: false
@@ -103,11 +94,7 @@ jobs:
       - name: Set build matrix based on set_release input
         id: set-matrix
         run: |
-          if [[ "${{ inputs.set_release }}" == "all" ]]; then
-            MATRIX='{"include":[{"release":"trixie"},{"release":"bookworm"},{"release":"resolute"},{"release":"noble"}]}'
-          else
-            MATRIX='{"include":[{"release":"${{ inputs.set_release }}"}]}'
-          fi
+          MATRIX='{"include":[{"release":"${{ inputs.set_release }}"}]}'
           echo "matrix=${MATRIX}" >> "${GITHUB_OUTPUT}"
 
   build:
@@ -141,7 +128,6 @@ jobs:
           sudo -E apt-get -y purge azure-cli ghc* zulu* llvm* firefox google* dotnet* powershell openjdk* mongodb* moby* || true
           sudo -E apt-get -y install $(curl -fsSL https://ophub.org/ubuntu2404-build-armbian-depends)
           sudo -E systemctl daemon-reload
-          #sudo -E apt-get -y full-upgrade
           sudo -E apt-get -y autoremove --purge
           sudo -E apt-get clean
           sudo sed -i '/NVM_DIR/d;/skel/d' /root/{.bashrc,.profile}
@@ -150,7 +136,6 @@ jobs:
           sudo -E ntpdate ntp.ubuntu.com 0.pool.ntp.org || true
           sudo -E timedatectl set-ntp true
           date -u
-          timedatectl status || true
           echo "status=success" >> ${GITHUB_OUTPUT}
 
       - name: Create virtual disk for extended storage
@@ -158,12 +143,10 @@ jobs:
         run: |
           root_avail=$(df --block-size=1G / | tail -1 | awk '{print $4}')
           root_size=$(( root_avail - 4 ))
-          [[ "${root_size}" -gt 0 ]] || { echo "Error: Insufficient space on /: ${root_avail}G available"; exit 1; }
+          [[ "${root_size}" -gt 0 ]] || { echo "Error: Insufficient space"; exit 1; }
 
           sudo truncate -s "${root_size}"G /root.img
           build_dev=$(sudo losetup --find --show /root.img)
-          echo "Using /: ${root_size}G"
-
           sudo mkfs.xfs -f -i sparse=0 -b size=4096 "${build_dev}"
           sudo mkdir -p /builder
           sudo mount "${build_dev}" /builder
@@ -176,7 +159,6 @@ jobs:
         working-directory: /builder
         if: ${{ steps.init.outputs.status == 'success' && !cancelled() }}
         run: |
-          df -hT ${PWD}
           git clone -q --single-branch --depth=1 --branch=main https://github.com/armbian/build.git build
           ln -sf /builder/build ${{ github.workspace }}/build
           ln -sf /builder/build /home/runner/work/_actions/ophub/amlogic-s9xxx-armbian/main/build
@@ -194,10 +176,11 @@ jobs:
 
           cd build/
           
-          # 【修改点 1】根据选择的内核动态切换 Armbian 官方上游的 BRANCH 分支
+          # 【彻底修复】根据官方规则，odroidn2 移除了 legacy 分支。
+          # 编译 6.12 统一通过 current 分支拉取上游环境，后续由第二阶段脚本强行替换目标内核。
           INPUT_KERNEL="${{ inputs.armbian_kernel }}"
-          if [[ "${INPUT_KERNEL}" == *"6.12"* ]]; then
-              BUILD_BRANCH="legacy"
+          if [[ "${INPUT_KERNEL}" == *"6.18"* || "${INPUT_KERNEL}" == *"edge"* ]]; then
+              BUILD_BRANCH="edge"
           else
               BUILD_BRANCH="current"
           fi
@@ -219,7 +202,6 @@ jobs:
           cd build/
           rm -rf $(ls . | grep -v "^output$" | xargs) 2>/dev/null
 
-          df -hT ${PWD}
           echo "build_tag=Armbian_${{ matrix.release }}_arm64_${{ inputs.armbian_edition }}_$(date +"%Y.%m")" >> ${GITHUB_ENV}
           echo "status=success" >> ${GITHUB_OUTPUT}
 
@@ -240,7 +222,6 @@ jobs:
         if: ${{ steps.clean.outputs.status == 'success' && !cancelled() }}
         with:
           build_target: armbian
-          # 【修改点 2】放宽匹配后缀，兼容 img 或 img.gz
           armbian_path: build/output/images/Armbian_*.img*
           armbian_board: ${{ inputs.armbian_board }}
           armbian_kernel: ${{ inputs.armbian_kernel }}
@@ -268,5 +249,4 @@ jobs:
             - Install command: `armbian-install`
             - Update command: `armbian-update`
             ### Applicable Platform
-            - 🐧 `arm64`
-            - 🐋 Docker image: https://hub.docker.com/u/ophub
+            - 🐧 `arm64` (Custom Built for HK1 Rbox K8s)
