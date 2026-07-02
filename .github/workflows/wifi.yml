@@ -3,14 +3,14 @@
 # Copyright (C) 2021 https://github.com/ophub/amlogic-s9xxx-armbian
 #==========================================================================
 
-name: k8s with rtl8733bs 
+name: k8s with wifi
 
 on:
   repository_dispatch:
   workflow_dispatch:
     inputs:
       set_release:
-        description: "Select OS Release."
+        description: "Select OS Release. (Recommend: bookworm / noble)"
         required: false
         default: "bookworm"
         type: choice
@@ -190,76 +190,12 @@ jobs:
 
           echo "status=success" >> ${GITHUB_OUTPUT}
 
-      - name: Organize output files and reclaim disk space (Inject RTL8733BS Driver)
+      - name: Organize output files and reclaim disk space
         id: clean
         if: ${{ steps.compile.outputs.status == 'success' && !cancelled() }}
         run: |
           chmod +x ${ROOTFS_SCRIPT}
           ${ROOTFS_SCRIPT} -v ${{ matrix.release }} -s true -c true -k true -p arm64
-
-          # ====================================================================
-          # 动态注入编译 rtl8733bs 驱动逻辑
-          # ====================================================================
-          echo "Starting custom driver compilation for rtl8733bs..."
-          ROOTFS_DIR="/builder/build/output/rootfs/${{ matrix.release }}-arm64"
-          
-          if [ -d "${ROOTFS_DIR}" ]; then
-              # 挂载必要的系统路径进入 chroot 空间
-              sudo mount -t proc chproc "${ROOTFS_DIR}/proc"
-              sudo mount -t sysfs chsys "${ROOTFS_DIR}/sys"
-              sudo mount --bind /dev "${ROOTFS_DIR}/dev"
-              sudo mount --bind /dev/pts "${ROOTFS_DIR}/dev/pts"
-              
-              # 写入编译与安装 rtl8733bs 驱动的脚本至 rootfs 内部
-              cat << 'EOF' | sudo tee "${ROOTFS_DIR}/tmp/compile_wifi.sh" > /dev/null
-          #!/bin/bash
-          export DEBIAN_FRONTEND=noninteractive
-          apt-get update
-          apt-get install -y build-essential dkms git bc sed xxd
-          
-          # 获取系统内现有的内核版本头文件
-          KERNEL_VERSION=$(ls /lib/modules/ | head -n 1)
-          if [ -n "${KERNEL_VERSION}" ]; then
-              apt-get install -y linux-headers-${KERNEL_VERSION} || echo "Headers already satisfied or managed manually."
-          fi
-
-          # 克隆用户指定的无线网卡驱动仓库
-          cd /usr/src
-          git clone --depth=1 https://github.com/xf110/rtl8733bs-20250521.git rtl8733bs-1.0
-          
-          # 编写符合该驱动仓库的 dkms.conf
-          cat << 'DKMS' > rtl8733bs-1.0/dkms.conf
-          PACKAGE_NAME="rtl8733bs"
-          PACKAGE_VERSION="1.0"
-          BUILT_MODULE_NAME[0]="8733bs"
-          DEST_MODULE_LOCATION[0]="/kernel/drivers/net/wireless/"
-          AUTOINSTALL="yes"
-          DKMS
-          
-          # 借助 DKMS 框架注册、编译并安装此内核模块驱动
-          dkms add -m rtl8733bs -v 1.0
-          dkms build -m rtl8733bs -v 1.0 -k ${KERNEL_VERSION}
-          dkms install -m rtl8733bs -v 1.0 -k ${KERNEL_VERSION}
-          
-          # 刷新模块依赖
-          depmod -a ${KERNEL_VERSION}
-          EOF
-              
-              # 赋予执行权限并使用 chroot 强行在目标系统架构环境下完成编译
-              sudo chmod +x "${ROOTFS_DIR}/tmp/compile_wifi.sh"
-              sudo chroot "${ROOTFS_DIR}" /bin/bash /tmp/compile_wifi.sh || echo "Warning: Custom wifi driver compilation encountered an issue."
-              
-              # 编译结束后，清理临时文件与解除挂载
-              sudo rm -f "${ROOTFS_DIR}/tmp/compile_wifi.sh"
-              sudo umount -f "${ROOTFS_DIR}/dev/pts" 2>/dev/null || true
-              sudo umount -f "${ROOTFS_DIR}/dev" 2>/dev/null || true
-              sudo umount -f "${ROOTFS_DIR}/sys" 2>/dev/null || true
-              sudo umount -f "${ROOTFS_DIR}/proc" 2>/dev/null || true
-              echo "RTL8733BS driver injection flow completed."
-          else
-              echo "Error: Rootfs path ${ROOTFS_DIR} not found, skipping driver compilation."
-          fi
-          # ====================================================================
 
           cd build/
           rm -rf $(ls . | grep -v "^output$" | xargs) 2>/dev/null
@@ -293,6 +229,77 @@ jobs:
           armbian_fstype: ${{ inputs.armbian_fstype }}
           builder_name: ${{ inputs.builder_name }}
 
+      # ====================================================================
+      # 新增步骤：在打包结束后，解压最终生成的镜像，利用 chroot 将驱动完美编译进去
+      # ====================================================================
+      - name: Inject RTL8733BS Wifi Driver into final image
+        if: ${{ env.PACKAGED_STATUS == 'success' && !cancelled() }}
+        run: |
+          echo "Unpacking finalized image to inject rtl8733bs driver..."
+          cd ${{ env.PACKAGED_OUTPUTPATH }}
+          IMG_NAME=$(ls Armbian_*.img | head -n 1)
+          
+          if [ -f "${IMG_NAME}" ]; then
+              # 挂载镜像文件
+              sudo mkdir -p /mnt/target_rootfs
+              LOOP_DEV=$(sudo losetup -P -f --show "${IMG_NAME}")
+              sudo mount "${LOOP_DEV}p2" /mnt/target_rootfs
+              
+              # 挂载虚拟文件系统
+              sudo mount -t proc chproc /mnt/target_rootfs/proc
+              sudo mount -t sysfs chsys /mnt/target_rootfs/sys
+              sudo mount --bind /dev /mnt/target_rootfs/dev
+              sudo mount --bind /dev/pts /mnt/target_rootfs/dev/pts
+
+              # 写入驱动编译运行脚本
+              cat << 'EOF' | sudo tee /mnt/target_rootfs/tmp/compile_wifi.sh > /dev/null
+          #!/bin/bash
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y build-essential dkms git bc sed xxd
+          
+          # 自动匹配当前系统已由 ophub 插件塞入的目标内核头文件
+          KERNEL_VERSION=$(ls /lib/modules/ | head -n 1)
+          if [ -n "${KERNEL_VERSION}" ]; then
+              apt-get install -y linux-headers-${KERNEL_VERSION} || echo "Headers install fallback."
+          fi
+
+          # 编译网卡模块
+          cd /usr/src
+          rm -rf rtl8733bs-1.0
+          git clone --depth=1 https://github.com/xf110/rtl8733bs-20250521.git rtl8733bs-1.0
+          
+          cat << 'DKMS' > rtl8733bs-1.0/dkms.conf
+          PACKAGE_NAME="rtl8733bs"
+          PACKAGE_VERSION="1.0"
+          BUILT_MODULE_NAME[0]="8733bs"
+          DEST_MODULE_LOCATION[0]="/kernel/drivers/net/wireless/"
+          AUTOINSTALL="yes"
+          DKMS
+          
+          dkms add -m rtl8733bs -v 1.0
+          dkms build -m rtl8733bs -v 1.0 -k ${KERNEL_VERSION}
+          dkms install -m rtl8733bs -v 1.0 -k ${KERNEL_VERSION}
+          depmod -a ${KERNEL_VERSION}
+          EOF
+              
+              # 在 chroot 内部环境执行编译
+              sudo chmod +x /mnt/target_rootfs/tmp/compile_wifi.sh
+              sudo chroot /mnt/target_rootfs /bin/bash /tmp/compile_wifi.sh || echo "DKMS module compile skipped or failed."
+              
+              # 清理并解除挂载
+              sudo rm -f /mnt/target_rootfs/tmp/compile_wifi.sh
+              sudo umount -f /mnt/target_rootfs/dev/pts 2>/dev/null || true
+              sudo umount -f /mnt/target_rootfs/dev 2>/dev/null || true
+              sudo umount -f /mnt/target_rootfs/sys 2>/dev/null || true
+              sudo umount -f /mnt/target_rootfs/proc 2>/dev/null || true
+              sudo umount -f /mnt/target_rootfs
+              sudo losetup -d "${LOOP_DEV}"
+              echo "RTL8733BS Driver Injection finished successfully."
+          else
+              echo "Target image not found, pass."
+          fi
+
       - name: Upload rebuilt images to Release
         uses: ophub/upload-to-releases@main
         if: ${{ env.PACKAGED_STATUS == 'success' && !cancelled() }}
@@ -311,4 +318,4 @@ jobs:
             - Install command: `armbian-install`
             - Update command: `armbian-update`
             ### Applicable Platform
-            - 🐧 `arm64` (Custom Built for HK1 Rbox K8s)
+            - 🐧 `arm64` (Custom Built for HK1 Rbox K8s with rtl8733bs driver)
