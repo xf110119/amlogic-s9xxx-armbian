@@ -49,7 +49,7 @@ jobs:
       run: |
         cd builder
 
-        ./rebuild \
+        sudo ./rebuild \
           -b hk1-rbox-k8s \
           -r ophub/kernel \
           -t ext4 \
