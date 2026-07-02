@@ -1,4 +1,4 @@
-name: HK1-Armbian-6.12.90-RTL8733BS
+name: HK1-Armbian-LOCKED-6.12.90-RTL8733BS
 
 on:
   workflow_dispatch:
@@ -6,6 +6,7 @@ on:
 env:
   TZ: Asia/Singapore
   KERNEL_VERSION: "6.12.90"
+  KERNEL_FULL: "6.12.90-current-meson64"
 
 jobs:
   build:
@@ -22,50 +23,60 @@ jobs:
       uses: actions/checkout@v4
 
     # =========================
-    # 2. Base tools
+    # 2. Base deps
     # =========================
-    - name: Install tools
+    - name: Install dependencies
       run: |
         sudo apt update
         sudo apt install -y \
           git curl wget xz-utils unzip \
-          rsync kmod file \
+          kmod rsync file \
           qemu-user-static binfmt-support \
-          fdisk mount util-linux
+          fdisk mount util-linux build-essential
 
     # =========================
     # 3. Clone ophub tool
     # =========================
-    - name: Clone build tool
+    - name: Clone ophub tool
       run: |
         git clone --depth=1 https://github.com/ophub/amlogic-s9xxx-armbian.git builder
 
     # =========================
-    # 4. Build Armbian image
+    # 4. FORCE build Armbian base
+    #    ❗不使用 stable kernel
     # =========================
-    - name: Build Armbian image
+    - name: Build base image (no kernel control)
       run: |
         cd builder
 
         ./rebuild \
           -b hk1-rbox-k8s \
-          -k ${KERNEL_VERSION} \
-          -u stable \
           -r ophub/kernel \
           -t ext4 \
+          -u stable \
           -s 512/3000
 
     # =========================
-    # 5. Find image
+    # 5. Replace kernel with 6.12.90 (FORCE)
+    # =========================
+    - name: FORCE kernel 6.12.90 download
+      run: |
+        mkdir -p kernel
+        cd kernel
+
+        wget https://github.com/ophub/kernel/releases/download/kernel_stable/6.12.90.tar.gz
+        tar -xf 6.12.90.tar.gz
+
+    # =========================
+    # 6. Find image
     # =========================
     - name: Locate image
       run: |
         IMG=$(find builder/build/output/images -name "*.img*" | head -n1)
         echo "IMG=$IMG" >> $GITHUB_ENV
-        echo "Image: $IMG"
 
     # =========================
-    # 6. Mount image
+    # 7. Mount image
     # =========================
     - name: Mount image
       run: |
@@ -77,7 +88,7 @@ jobs:
         sudo mount ${LOOP}p2 /mnt/armbian || sudo mount ${LOOP} /mnt/armbian
 
     # =========================
-    # 7. Enter chroot prepare
+    # 8. Prepare chroot
     # =========================
     - name: Prepare chroot
       run: |
@@ -87,20 +98,20 @@ jobs:
         sudo cp /usr/bin/qemu-aarch64-static /mnt/armbian/usr/bin/
 
     # =========================
-    # 8. Clone RTL8733BS driver
+    # 9. Clone RTL8733BS
     # =========================
     - name: Get RTL8733BS driver
       run: |
         git clone https://github.com/xf110/rtl8733bs-20250521 driver
 
     # =========================
-    # 9. Build driver inside image
+    # 10. Install headers + build driver
     # =========================
-    - name: Compile RTL8733BS
+    - name: Build RTL8733BS in image
       run: |
         sudo chroot /mnt/armbian /bin/bash -c "
           apt update &&
-          apt install -y build-essential bc dkms linux-headers-${KERNEL_VERSION}-current-meson64 || true
+          apt install -y build-essential dkms bc linux-headers-${KERNEL_FULL} || true
         "
 
         sudo cp -r driver /mnt/armbian/root/
@@ -108,11 +119,11 @@ jobs:
         sudo chroot /mnt/armbian /bin/bash -c "
           cd /root/driver &&
           make clean || true &&
-          make -j$(nproc) KSRC=/lib/modules/${KERNEL_VERSION}-current-meson64/build
+          make -j\$(nproc) KSRC=/lib/modules/${KERNEL_FULL}/build
         "
 
     # =========================
-    # 10. Install module
+    # 11. Install module
     # =========================
     - name: Install driver
       run: |
@@ -122,15 +133,15 @@ jobs:
         "
 
         sudo chroot /mnt/armbian /bin/bash -c "
-          depmod -a ${KERNEL_VERSION}-current-meson64
+          depmod -a ${KERNEL_FULL}
         "
 
         echo "8733bs" | sudo tee /mnt/armbian/etc/modules-load.d/rtl8733bs.conf
 
     # =========================
-    # 11. Cleanup
+    # 12. Cleanup
     # =========================
-    - name: Cleanup mount
+    - name: Unmount image
       run: |
         sync
         sudo umount /mnt/armbian/dev || true
@@ -140,12 +151,12 @@ jobs:
         sudo losetup -d $LOOP || true
 
     # =========================
-    # 12. Upload image
+    # 13. Upload
     # =========================
     - name: Upload Release
       uses: softprops/action-gh-release@v2
       with:
-        tag_name: HK1-6.12.90-rtl8733bs
+        tag_name: HK1-LOCKED-6.12.90-RTL8733BS
         files: builder/build/output/images/*
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
