@@ -1,173 +1,140 @@
-#==========================================================================
-# Description: Fast Armbian builder for HK1 Rbox K8s (API Dynamic Download Mode)
-#==========================================================================
-
-name: Build Armbian arm64 server image (Optimized & Fast)
+name: Build Armbian HK1-Rbox-K8s (6.12.90)
 
 on:
-  repository_dispatch:
   workflow_dispatch:
-    inputs:
-      set_release:
-        description: "选择操作系统版本 (推荐: bookworm)"
-        required: false
-        default: "bookworm"
-        type: choice
-        options:
-          - bookworm
-          - noble
-      armbian_board:
-        description: "选择设备板型"
-        required: false
-        default: "hk1-rbox-k8s"
-        type: choice
-        options:
-          - hk1-rbox-k8s
-      armbian_kernel:
-        description: "选择内核版本"
-        required: false
-        default: "6.12.90"
-      kernel_repo:
-        description: "设置内核仓库"
-        required: false
-        default: "ophub/kernel"
-        type: choice
-        options:
-          - ophub/kernel
-      kernel_usage:
-        description: "设置内核稳定版标签"
-        required: false
-        default: "stable"
-        type: choice
-        options:
-          - stable
+  repository_dispatch:
 
 env:
-  TZ: Etc/UTC
+  TZ: Asia/Singapore
+  ROOTFS_SCRIPT: compile-kernel/tools/script/docker/build_armbian_rootfs_file.sh
 
 jobs:
   build:
     runs-on: ubuntu-24.04
-    if: ${{ github.event.repository.owner.id == github.event.sender.id }}
     permissions:
       contents: write
 
     steps:
-      - name: 📥 签出项目源码
+      # =========================
+      # 1. Checkout
+      # =========================
+      - name: Checkout
         uses: actions/checkout@v6
 
-      - name: ⚙️ 初始化构建环境
+      # =========================
+      # 2. Clean environment
+      # =========================
+      - name: Init build environment
         run: |
-          sudo apt-get -y update
-          sudo apt-get -y install git curl parted lshw binfmt-support qemu-user-static xz-utils pigz jq cpio
-          echo "build_tag=Armbian_${{ inputs.set_release }}_${{ inputs.armbian_board }}_$(date +"%Y.%m")" >> ${GITHUB_ENV}
+          sudo swapoff -a || true
+          sudo rm -f /swapfile || true
 
-      - name: 🚚 动态通过 API 获取最新 Rootfs
+          sudo apt-get update
+          sudo apt-get install -y \
+            git curl wget xz-utils zip unzip \
+            qemu-user-static binfmt-support \
+            coreutils util-linux
+
+          sudo timedatectl set-timezone "${TZ}"
+          date -u
+
+      # =========================
+      # 3. Create build disk
+      # =========================
+      - name: Create build disk
         run: |
-          mkdir -p build/output/images
-          cd build/output/images
-          
-          echo "Fetching rootfs download URL via GitHub API..."
-          # 100% 可靠：直接查询 ophub 仓库的发布列表，动态抽取当前绝对可用的 bookworm rootfs 直链
-          ROOTFS_URL=$(curl -s https://api.github.com/repos/ophub/amlogic-s9xxx-armbian/releases | \
-                       jq -r '.[] | select(.tag_name | contains("armbian_rootfs")) | .assets[] | select(.name | contains("'${{ inputs.set_release }}'")) | .browser_download_url' | head -n 1)
-          
-          if [ -z "${ROOTFS_URL}" ] || [ "${ROOTFS_URL}" = "null" ]; then
-              echo "Primary API failed, trying backup repository..."
-              ROOTFS_URL=$(curl -s https://api.github.com/repos/break2024/amlogic-s9xxx-armbian/releases | \
-                           jq -r '.[] | select(.tag_name | contains("armbian_rootfs")) | .assets[] | select(.name | contains("'${{ inputs.set_release }}'")) | .browser_download_url' | head -n 1)
-          fi
-          
-          echo "Dynamic Rootfs URL located: ${ROOTFS_URL}"
-          
-          # 执行下载
-          curl -f -L -o "Armbian_base_${{ inputs.set_release }}_arm64.tar.gz" "${ROOTFS_URL}"
-          ls -lh .
+          root_avail=$(df --block-size=1G / | tail -1 | awk '{print $4}')
+          root_size=$((root_avail - 3))
 
-      - name: 🛠️ 重新打包 Armbian 目标盒子固件
+          sudo truncate -s "${root_size}"G /root.img
+          loop=$(sudo losetup --find --show /root.img)
+
+          sudo mkfs.ext4 -F "${loop}"
+          sudo mkdir -p /builder
+          sudo mount "${loop}" /builder
+          sudo chown -R runner:runner /builder
+
+      # =========================
+      # 4. Download Armbian build
+      # =========================
+      - name: Clone Armbian build
+        working-directory: /builder
+        run: |
+          git clone --depth=1 https://github.com/armbian/build.git build
+          ln -sf /builder/build $GITHUB_WORKSPACE/build
+
+      # =========================
+      # 5. Compile Armbian rootfs
+      # =========================
+      - name: Build Armbian (Bookworm)
+        working-directory: /builder/build
+        run: |
+          chmod +x compile.sh
+
+          ./compile.sh \
+            RELEASE=bookworm \
+            BOARD=odroidn2 \
+            BRANCH=current \
+            BUILD_MINIMAL=no \
+            BUILD_DESKTOP=no \
+            KERNEL_CONFIGURE=no \
+            EXPERT=yes \
+            COMPRESS_OUTPUTIMAGE="sha"
+
+      # =========================
+      # 6. Prepare output
+      # =========================
+      - name: Prepare output
+        run: |
+          mkdir -p release
+          cp -f /builder/build/output/images/*.img* release/
+
+      # =========================
+      # 7. Upload base image
+      # =========================
+      - name: Upload base image
+        uses: ophub/upload-to-releases@main
+        with:
+          tag: "HK1-Rbox-K8s-6.12.90"
+          artifacts: release/*
+          allow_updates: true
+          make_latest: true
+          gh_token: ${{ secrets.GITHUB_TOKEN }}
+
+      # =========================
+      # 8. Rebuild kernel (IMPORTANT)
+      # =========================
+      - name: Repack with ophub kernel 6.12.90
         uses: ophub/amlogic-s9xxx-armbian@main
         with:
           build_target: armbian
-          # 彻底解决报错：明确喂给它一个物理存在的文件路径通配符
-          armbian_path: build/output/images/Armbian_base_*.tar.gz
-          armbian_board: ${{ inputs.armbian_board }}
-          armbian_kernel: ${{ inputs.armbian_kernel }}
+          armbian_path: release/*.img*
+          armbian_board: hk1-rbox-k8s
+          armbian_kernel: 6.12.90
           auto_kernel: false
-          kernel_repo: ${{ inputs.kernel_repo }}
-          kernel_usage: ${{ inputs.kernel_usage }}
+          kernel_repo: ophub/kernel
+          kernel_usage: stable
+          armbian_fstype: ext4
+          builder_name: ophub
 
-      - name: 💉 注入 RTL8733BS 无线网卡驱动
-        if: ${{ env.PACKAGED_STATUS == 'success' && !cancelled() }}
-        run: |
-          echo "Injecting rtl8733bs driver..."
-          cd ${{ env.PACKAGED_OUTPUTPATH }}
-          IMG_NAME=$(ls Armbian_*.img | head -n 1)
-          
-          if [ -f "${IMG_NAME}" ]; then
-              sudo mkdir -p /mnt/target_rootfs
-              LOOP_DEV=$(sudo losetup -P -f --show "${IMG_NAME}")
-              sudo mount "${LOOP_DEV}p2" /mnt/target_rootfs
-              
-              sudo mount -t proc chproc /mnt/target_rootfs/proc
-              sudo mount -t sysfs chsys /mnt/target_rootfs/sys
-              sudo mount --bind /dev /mnt/target_rootfs/dev
-              sudo mount --bind /dev/pts /mnt/target_rootfs/dev/pts
-
-              cat << 'EOF' | sudo tee /mnt/target_rootfs/tmp/compile_wifi.sh > /dev/null
-          #!/bin/bash
-          export DEBIAN_FRONTEND=noninteractive
-          apt-get update
-          apt-get install -y build-essential dkms git bc sed xxd
-          
-          KERNEL_VERSION=$(ls /lib/modules/ | head -n 1)
-          if [ -n "${KERNEL_VERSION}" ]; then
-              apt-get install -y linux-headers-${KERNEL_VERSION} || echo "Headers warning."
-          fi
-
-          cd /usr/src
-          rm -rf rtl8733bs-1.0
-          git clone --depth=1 https://github.com/xf110/rtl8733bs-20250521.git rtl8733bs-1.0
-          
-          cat << 'DKMS' > rtl8733bs-1.0/dkms.conf
-          PACKAGE_NAME="rtl8733bs"
-          PACKAGE_VERSION="1.0"
-          BUILT_MODULE_NAME[0]="8733bs"
-          DEST_MODULE_LOCATION[0]="/kernel/drivers/net/wireless/"
-          AUTOINSTALL="yes"
-          DKMS
-          
-          dkms add -m rtl8733bs -v 1.0
-          dkms build -m rtl8733bs -v 1.0 -k ${KERNEL_VERSION}
-          dkms install -m rtl8733bs -v 1.0 -k ${KERNEL_VERSION}
-          depmod -a ${KERNEL_VERSION}
-          EOF
-              
-              sudo chmod +x /mnt/target_rootfs/tmp/compile_wifi.sh
-              sudo chroot /mnt/target_rootfs /bin/bash /tmp/compile_wifi.sh || echo "Driver build skipped."
-              
-              sudo rm -f /mnt/target_rootfs/tmp/compile_wifi.sh
-              sudo umount -f /mnt/target_rootfs/dev/pts 2>/dev/null || true
-              sudo umount -f /mnt/target_rootfs/dev/2>/dev/null || true
-              sudo umount -f /mnt/target_rootfs/sys 2>/dev/null || true
-              sudo umount -f /mnt/target_rootfs/proc 2>/dev/null || true
-              sudo umount -f /mnt/target_rootfs
-              sudo losetup -d "${LOOP_DEV}"
-              echo "Driver Injection finished."
-          fi
-
-      - name: 🚀 上传最终带驱动固件至 Release
+      # =========================
+      # 9. Upload final image
+      # =========================
+      - name: Upload final image
         uses: ophub/upload-to-releases@main
-        if: ${{ env.PACKAGED_STATUS == 'success' && !cancelled() }}
         with:
-          tag: ${{ env.build_tag }}
+          tag: "HK1-Rbox-K8s-6.12.90"
           artifacts: ${{ env.PACKAGED_OUTPUTPATH }}/*
           allow_updates: true
-          remove_artifacts: false
-          replaces_artifacts: true
           make_latest: true
           gh_token: ${{ secrets.GITHUB_TOKEN }}
           body: |
-            ### Armbian Image for HK1 Rbox K8s
-            - Target Kernel: ${{ inputs.armbian_kernel }}
-            - Wifi Driver: Included (`rtl8733bs` built via DKMS)
-            - Default credentials: `root` / `1234`
+            ## HK1 Rbox K8s Armbian Image
+
+            - Board: hk1-rbox-k8s
+            - Kernel: 6.12.90
+            - Release: bookworm
+            - Default user: root
+            - Default password: 1234
+            - Install: armbian-install
+            - Update: armbian-update
