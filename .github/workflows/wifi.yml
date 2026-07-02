@@ -1,9 +1,8 @@
 #==========================================================================
-# Description: Build Armbian arm64 server image (Optimized for hk1-rbox-k8s)
-# Copyright (C) 2021 https://github.com/ophub/amlogic-s9xxx-armbian
+# Description: Minimal Armbian builder with custom driver injection
 #==========================================================================
 
-name: Build Armbian arm64 server image
+name: Build Armbian arm64 server image (Optimized & Fast)
 
 on:
   repository_dispatch:
@@ -16,8 +15,6 @@ on:
         type: choice
         options:
           - bookworm
-          - trixie
-          - resolute
           - noble
       armbian_board:
         description: "Select device board."
@@ -27,15 +24,9 @@ on:
         options:
           - hk1-rbox-k8s
       armbian_kernel:
-        description: "Select kernel version. (Must be specific if auto_kernel is false)"
+        description: "Select kernel version. (e.g., 6.12.15)"
         required: false
-        default: "6.12.15"  # <--- 彻底修复：改为具体的内核版本号，避免 404
-        type: choice
-        options:
-          - 6.12.15
-          - 6.6.21
-          - 6.1.80
-          - 6.18.1
+        default: "6.12.15"
       kernel_repo:
         description: "Set the kernel repository."
         required: false
@@ -50,191 +41,45 @@ on:
         type: choice
         options:
           - stable
-          - flippy
-          - beta
-      armbian_fstype:
-        description: "Select armbian rootfs type."
-        required: false
-        default: "ext4"
-        type: choice
-        options:
-          - ext4
-          - btrfs
-      armbian_edition:
-        description: "Select image edition type."
-        required: false
-        default: "server"
-        type: choice
-        options:
-          - server
-          - desktop
-      builder_name:
-        description: "Set Armbian builder signature."
-        required: false
-        default: "ophub"
-        type: choice
-        options:
-          - ophub
-      config_board:
-        description: "Set the base Armbian board name."
-        required: false
-        default: "odroidn2"
 
 env:
   TZ: Etc/UTC
-  ROOTFS_SCRIPT: compile-kernel/tools/script/docker/build_armbian_rootfs_file.sh
 
 jobs:
-  setup:
-    runs-on: ubuntu-24.04
-    outputs:
-      matrix: ${{ steps.set-matrix.outputs.matrix }}
-    steps:
-      - name: Set build matrix based on set_release input
-        id: set-matrix
-        run: |
-          MATRIX='{"include":[{"release":"${{ inputs.set_release }}"}]}'
-          echo "matrix=${MATRIX}" >> "${GITHUB_OUTPUT}"
-
   build:
-    needs: setup
     runs-on: ubuntu-24.04
     if: ${{ github.event.repository.owner.id == github.event.sender.id }}
     permissions:
       contents: write
 
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
-
-    name: build-armbian-${{ matrix.release }}
-
     steps:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Initialize the build environment
-        id: init
-        env:
-          DEBIAN_FRONTEND: noninteractive
+      - name: Initialize environment
         run: |
-          docker rmi -f $(docker images -q) 2>/dev/null || true
-          [[ -n "${AGENT_TOOLSDIRECTORY}" ]] && sudo rm -rf "${AGENT_TOOLSDIRECTORY}"
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android 2>/dev/null
-          sudo swapoff -a
-          sudo rm -f /swapfile /mnt/swapfile
-          sudo -E apt-get -y update
-          sudo -E apt-get -y purge azure-cli ghc* zulu* llvm* firefox google* dotnet* powershell openjdk* mongodb* moby* || true
-          sudo -E apt-get -y install $(curl -fsSL https://ophub.org/ubuntu2404-build-armbian-depends)
-          sudo -E systemctl daemon-reload
-          sudo -E apt-get -y autoremove --purge
-          sudo -E apt-get clean
-          sudo sed -i '/NVM_DIR/d;/skel/d' /root/{.bashrc,.profile}
-          sudo rm -rf ~/{.cargo,.dotnet,.rustup}
-          sudo -E timedatectl set-timezone "${TZ:-Etc/UTC}"
-          sudo -E ntpdate ntp.ubuntu.com 0.pool.ntp.org || true
-          sudo -E timedatectl set-ntp true
-          date -u
-          echo "status=success" >> ${GITHUB_OUTPUT}
+          sudo apt-get -y update
+          sudo apt-get -y install git curl parted lshw binfmt-support qemu-user-static
+          echo "build_tag=Armbian_${{ inputs.set_release }}_${{ inputs.armbian_board }}_$(date +"%Y.%m")" >> ${GITHUB_ENV}
 
-      - name: Create virtual disk for extended storage
-        id: disk
-        run: |
-          root_avail=$(df --block-size=1G / | tail -1 | awk '{print $4}')
-          root_size=$(( root_avail - 4 ))
-          [[ "${root_size}" -gt 0 ]] || { echo "Error: Insufficient space"; exit 1; }
-
-          sudo truncate -s "${root_size}"G /root.img
-          build_dev=$(sudo losetup --find --show /root.img)
-          sudo mkfs.xfs -f -i sparse=0 -b size=4096 "${build_dev}"
-          sudo mkdir -p /builder
-          sudo mount "${build_dev}" /builder
-          sudo chown -R runner:runner /builder
-          df -Th
-          echo "status=success" >> ${GITHUB_OUTPUT}
-
-      - name: Download Armbian source code
-        id: down
-        working-directory: /builder
-        if: ${{ steps.init.outputs.status == 'success' && !cancelled() }}
-        run: |
-          git clone -q --single-branch --depth=1 --branch=main https://github.com/armbian/build.git build
-          ln -sf /builder/build ${{ github.workspace }}/build
-          ln -sf /builder/build /home/runner/work/_actions/ophub/amlogic-s9xxx-armbian/main/build
-          echo "status=success" >> ${GITHUB_OUTPUT}
-
-      - name: Compile Armbian [ ${{ matrix.release }} ]
-        id: compile
-        working-directory: /builder
-        if: ${{ steps.down.outputs.status == 'success' && !cancelled() }}
-        run: |
-          docker run --rm --privileged multiarch/qemu-user-static --reset -p yes 2>/dev/null || true
-
-          config_board="${{ inputs.config_board }}"
-          [[ -z "${config_board}" ]] && config_board="odroidn2"
-
-          cd build/
-          
-          INPUT_KERNEL="${{ inputs.armbian_kernel }}"
-          if [[ "${INPUT_KERNEL}" == *"6.18"* || "${INPUT_KERNEL}" == *"edge"* ]]; then
-              BUILD_BRANCH="edge"
-          else
-              BUILD_BRANCH="current"
-          fi
-          echo "Using Armbian Branch: ${BUILD_BRANCH} for kernel ${INPUT_KERNEL}"
-
-          ./compile.sh RELEASE=${{ matrix.release }} BOARD=${config_board} BRANCH=${BUILD_BRANCH} BUILD_MINIMAL=no \
-                       BUILD_ONLY=default HOST=armbian BUILD_DESKTOP=no EXPERT=yes KERNEL_CONFIGURE=no \
-                       COMPRESS_OUTPUTIMAGE="sha" SHARE_LOG=yes
-
-          echo "status=success" >> ${GITHUB_OUTPUT}
-
-      - name: Organize output files and reclaim disk space
-        id: clean
-        if: ${{ steps.compile.outputs.status == 'success' && !cancelled() }}
-        run: |
-          chmod +x ${ROOTFS_SCRIPT}
-          ${ROOTFS_SCRIPT} -v ${{ matrix.release }} -s true -c true -k true -p arm64
-
-          cd build/
-          rm -rf $(ls . | grep -v "^output$" | xargs) 2>/dev/null
-
-          echo "build_tag=Armbian_${{ matrix.release }}_arm64_${{ inputs.armbian_edition }}_$(date +"%Y.%m")" >> ${GITHUB_ENV}
-          echo "status=success" >> ${GITHUB_OUTPUT}
-
-      - name: Upload Armbian image to Release
-        uses: ophub/upload-to-releases@main
-        if: ${{ steps.clean.outputs.status == 'success' && !cancelled() }}
-        with:
-          tag: ${{ env.build_tag }}
-          artifacts: build/output/images/*
-          allow_updates: true
-          remove_artifacts: false
-          replaces_artifacts: true
-          make_latest: true
-          gh_token: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Rebuild Armbian for target boards
+      # 核心步骤 1：利用插件的 auto_download 功能自动拉取 Ophub 官方仓库的干净基础包进行重组
+      - name: Rebuild Armbian for target board
         uses: ophub/amlogic-s9xxx-armbian@main
-        if: ${{ steps.clean.outputs.status == 'success' && !cancelled() }}
         with:
           build_target: armbian
-          armbian_path: build/output/images/Armbian_*.img*
           armbian_board: ${{ inputs.armbian_board }}
           armbian_kernel: ${{ inputs.armbian_kernel }}
-          auto_kernel: false  # 保持关闭，严格去抓取我们给定的具体 6.12.x 版本
+          auto_kernel: false
           kernel_repo: ${{ inputs.kernel_repo }}
           kernel_usage: ${{ inputs.kernel_usage }}
-          armbian_fstype: ${{ inputs.armbian_fstype }}
-          builder_name: ${{ inputs.builder_name }}
+          # 彻底修复：允许插件在 armbian_path 为空时，自动去上游下载对应 release 的基础 rootfs
+          auto_download: true
 
-      # ====================================================================
-      # 驱动注入步骤
-      # ====================================================================
-      - name: Inject RTL8733BS Wifi Driver into final image
+      # 核心步骤 2：解压生成的最终镜像，通过 chroot 编译并注入无线网卡驱动
+      - name: Inject RTL8733BS Wifi Driver
         if: ${{ env.PACKAGED_STATUS == 'success' && !cancelled() }}
         run: |
-          echo "Unpacking finalized image to inject rtl8733bs driver..."
+          echo "Injecting rtl8733bs driver..."
           cd ${{ env.PACKAGED_OUTPUTPATH }}
           IMG_NAME=$(ls Armbian_*.img | head -n 1)
           
@@ -256,7 +101,7 @@ jobs:
           
           KERNEL_VERSION=$(ls /lib/modules/ | head -n 1)
           if [ -n "${KERNEL_VERSION}" ]; then
-              apt-get install -y linux-headers-${KERNEL_VERSION} || echo "Headers install fallback."
+              apt-get install -y linux-headers-${KERNEL_VERSION} || echo "Headers warning."
           fi
 
           cd /usr/src
@@ -278,21 +123,20 @@ jobs:
           EOF
               
               sudo chmod +x /mnt/target_rootfs/tmp/compile_wifi.sh
-              sudo chroot /mnt/target_rootfs /bin/bash /tmp/compile_wifi.sh || echo "DKMS module compile skipped or failed."
+              sudo chroot /mnt/target_rootfs /bin/bash /tmp/compile_wifi.sh || echo "Driver build skipped."
               
               sudo rm -f /mnt/target_rootfs/tmp/compile_wifi.sh
               sudo umount -f /mnt/target_rootfs/dev/pts 2>/dev/null || true
-              sudo umount -f /mnt/target_rootfs/dev 2>/dev/null || true
+              sudo umount -f /mnt/target_rootfs/dev/2>/dev/null || true
               sudo umount -f /mnt/target_rootfs/sys 2>/dev/null || true
               sudo umount -f /mnt/target_rootfs/proc 2>/dev/null || true
               sudo umount -f /mnt/target_rootfs
               sudo losetup -d "${LOOP_DEV}"
-              echo "RTL8733BS Driver Injection finished successfully."
-          else
-              echo "Target image not found, pass."
+              echo "Driver Injection finished."
           fi
 
-      - name: Upload rebuilt images to Release
+      # 核心步骤 3：只上传最终带驱动的镜像
+      - name: Upload finalized image to Release
         uses: ophub/upload-to-releases@main
         if: ${{ env.PACKAGED_STATUS == 'success' && !cancelled() }}
         with:
@@ -304,10 +148,7 @@ jobs:
           make_latest: true
           gh_token: ${{ secrets.GITHUB_TOKEN }}
           body: |
-            ### Armbian Image Information
-            - Default username: `root`
-            - Default password: `1234`
-            - Install command: `armbian-install`
-            - Update command: `armbian-update`
-            ### Applicable Platform
-            - 🐧 `arm64` (Custom Built for HK1 Rbox K8s with rtl8733bs driver)
+            ### Armbian Image for HK1 Rbox K8s
+            - Kernel: ${{ inputs.armbian_kernel }}
+            - Wifi Driver: Included (`rtl8733bs`)
+            - Default credentials: `root` / `1234`
