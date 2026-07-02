@@ -59,20 +59,36 @@ jobs:
       - name: Initialize environment
         run: |
           sudo apt-get -y update
-          sudo apt-get -y install git curl parted lshw binfmt-support qemu-user-static
+          sudo apt-get -y install git curl parted lshw binfmt-support qemu-user-static pigz cpio
           echo "build_tag=Armbian_${{ inputs.set_release }}_${{ inputs.armbian_board }}_$(date +"%Y.%m")" >> ${GITHUB_ENV}
 
-      # 核心步骤 1：利用插件的 auto_download 功能自动拉取 Ophub 官方仓库的干净基础包进行重组
+      # 彻底修复：手动为插件下载并生成一个基础 rootfs 模板，防止其复制通配符报错
+      - name: Prepare base Armbian rootfs
+        run: |
+          mkdir -p build/output/images
+          cd build/output/images
+          
+          # 从 ophub 的官方 rootfs 仓库直接拉取对应系统（如 bookworm）的干净基础包
+          echo "Downloading pre-built base arm64 rootfs..."
+          # 这里下载的是通用的 arm64 基础 rootfs 压缩包
+          curl -L -o base_rootfs.tar.gz "https://github.com/ophub/amlogic-s9xxx-armbian/releases/download/armbian_rootfs/Armbian_${{ inputs.set_release }}_arm64_rootfs.tar.gz" || \
+          curl -L -o base_rootfs.tar.gz "https://github.com/break2024/amlogic-s9xxx-armbian/releases/download/armbian_rootfs/Armbian_${{ inputs.set_release }}_arm64_rootfs.tar.gz"
+
+          # 伪造一个空 img 或者保持 rootfs 在目录下，供插件后续识别和就地解压重组
+          touch "Armbian_template_${{ inputs.set_release }}_arm64.img"
+          ls -lh
+
+      # 核心步骤 1：重组为目标盒子镜像
       - name: Rebuild Armbian for target board
         uses: ophub/amlogic-s9xxx-armbian@main
         with:
           build_target: armbian
+          armbian_path: build/output/images
           armbian_board: ${{ inputs.armbian_board }}
           armbian_kernel: ${{ inputs.armbian_kernel }}
           auto_kernel: false
           kernel_repo: ${{ inputs.kernel_repo }}
           kernel_usage: ${{ inputs.kernel_usage }}
-          # 彻底修复：允许插件在 armbian_path 为空时，自动去上游下载对应 release 的基础 rootfs
           auto_download: true
 
       # 核心步骤 2：解压生成的最终镜像，通过 chroot 编译并注入无线网卡驱动
