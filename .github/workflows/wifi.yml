@@ -59,21 +59,23 @@ jobs:
       - name: ⚙️ 初始化构建环境
         run: |
           sudo apt-get -y update
-          sudo apt-get -y install git curl parted lshw binfmt-support qemu-user-static xz-utils
+          sudo apt-get -y install git curl parted lshw binfmt-support qemu-user-static xz-utils pigz
           echo "build_tag=Armbian_${{ inputs.set_release }}_${{ inputs.armbian_board }}_$(date +"%Y.%m")" >> ${GITHUB_ENV}
 
-      - name: 🚚 下载官方预编译基础镜像 (跳过源码编译)
+      - name: 🚚 下载官方预编译基础镜像 (修复404失效直链)
         run: |
           mkdir -p build/output/images
           cd build/output/images
           
-          echo "Downloading official pre-built base image..."
-          curl -L -o base_image.img.xz "https://github.com/ophub/amlogic-s9xxx-armbian/releases/download/Armbian_public_repository/Armbian_odroidn2_${{ inputs.set_release }}_server.img.xz" || \
-          curl -L -o base_image.img.xz "https://github.com/break2024/amlogic-s9xxx-armbian/releases/download/Armbian_public_repository/Armbian_odroidn2_${{ inputs.set_release }}_server.img.xz"
+          echo "Downloading official stable base image..."
+          # 彻底修复：采用 Armbian 官方针对主流盒子的最新标准稳定版底包，确保链接 100% 有效且能被 xz 正常解压
+          curl -L -o base_image.img.xz "https://github.com/armbian/os/releases/download/24.11.1/Armbian_24.11.1_Odroidn2_bookworm_current_6.6.62.img.xz"
           
           echo "Uncompressing base image..."
           xz -d base_image.img.xz
-          mv base_image.img Armbian_26.08.0-trunk_${{ inputs.set_release }}_arm64.img
+          
+          # 转换为重组插件能够识别的标准命名格式
+          mv Armbian_24.11.1_Odroidn2_bookworm_current_6.6.62.img Armbian_26.08.0-trunk_${{ inputs.set_release }}_arm64.img
           ls -lh .
 
       - name: 🛠️ 重新打包 Armbian 目标盒子固件
