@@ -176,8 +176,7 @@ jobs:
 
           cd build/
           
-          # 【彻底修复】根据官方规则，odroidn2 移除了 legacy 分支。
-          # 编译 6.12 统一通过 current 分支拉取上游环境，后续由第二阶段脚本强行替换目标内核。
+          # 根据填入的内核版本判断第一阶段的分支选择
           INPUT_KERNEL="${{ inputs.armbian_kernel }}"
           if [[ "${INPUT_KERNEL}" == *"6.18"* || "${INPUT_KERNEL}" == *"edge"* ]]; then
               BUILD_BRANCH="edge"
@@ -225,7 +224,7 @@ jobs:
           armbian_path: build/output/images/Armbian_*.img*
           armbian_board: ${{ inputs.armbian_board }}
           armbian_kernel: ${{ inputs.armbian_kernel }}
-          auto_kernel: true
+          auto_kernel: false # 彻底修复：关闭自动检测，严格使用指定的内核版本进行二次打包
           kernel_repo: ${{ inputs.kernel_repo }}
           kernel_usage: ${{ inputs.kernel_usage }}
           armbian_fstype: ${{ inputs.armbian_fstype }}
