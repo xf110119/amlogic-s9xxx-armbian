@@ -1,12 +1,11 @@
-name: Build Armbian HK1-Rbox-K8s (6.12.90)
+name: HK1-Armbian-6.12.90-RTL8733BS
 
 on:
   workflow_dispatch:
-  repository_dispatch:
 
 env:
   TZ: Asia/Singapore
-  ROOTFS_SCRIPT: compile-kernel/tools/script/docker/build_armbian_rootfs_file.sh
+  KERNEL_VERSION: "6.12.90"
 
 jobs:
   build:
@@ -15,126 +14,138 @@ jobs:
       contents: write
 
     steps:
-      # =========================
-      # 1. Checkout
-      # =========================
-      - name: Checkout
-        uses: actions/checkout@v6
 
-      # =========================
-      # 2. Clean environment
-      # =========================
-      - name: Init build environment
-        run: |
-          sudo swapoff -a || true
-          sudo rm -f /swapfile || true
+    # =========================
+    # 1. Checkout
+    # =========================
+    - name: Checkout
+      uses: actions/checkout@v4
 
-          sudo apt-get update
-          sudo apt-get install -y \
-            git curl wget xz-utils zip unzip \
-            qemu-user-static binfmt-support \
-            coreutils util-linux
+    # =========================
+    # 2. Base tools
+    # =========================
+    - name: Install tools
+      run: |
+        sudo apt update
+        sudo apt install -y \
+          git curl wget xz-utils unzip \
+          rsync kmod file \
+          qemu-user-static binfmt-support \
+          fdisk mount util-linux
 
-          sudo timedatectl set-timezone "${TZ}"
-          date -u
+    # =========================
+    # 3. Clone ophub tool
+    # =========================
+    - name: Clone build tool
+      run: |
+        git clone --depth=1 https://github.com/ophub/amlogic-s9xxx-armbian.git builder
 
-      # =========================
-      # 3. Create build disk
-      # =========================
-      - name: Create build disk
-        run: |
-          root_avail=$(df --block-size=1G / | tail -1 | awk '{print $4}')
-          root_size=$((root_avail - 3))
+    # =========================
+    # 4. Build Armbian image
+    # =========================
+    - name: Build Armbian image
+      run: |
+        cd builder
 
-          sudo truncate -s "${root_size}"G /root.img
-          loop=$(sudo losetup --find --show /root.img)
+        ./rebuild \
+          -b hk1-rbox-k8s \
+          -k ${KERNEL_VERSION} \
+          -u stable \
+          -r ophub/kernel \
+          -t ext4 \
+          -s 512/3000
 
-          sudo mkfs.ext4 -F "${loop}"
-          sudo mkdir -p /builder
-          sudo mount "${loop}" /builder
-          sudo chown -R runner:runner /builder
+    # =========================
+    # 5. Find image
+    # =========================
+    - name: Locate image
+      run: |
+        IMG=$(find builder/build/output/images -name "*.img*" | head -n1)
+        echo "IMG=$IMG" >> $GITHUB_ENV
+        echo "Image: $IMG"
 
-      # =========================
-      # 4. Download Armbian build
-      # =========================
-      - name: Clone Armbian build
-        working-directory: /builder
-        run: |
-          git clone --depth=1 https://github.com/armbian/build.git build
-          ln -sf /builder/build $GITHUB_WORKSPACE/build
+    # =========================
+    # 6. Mount image
+    # =========================
+    - name: Mount image
+      run: |
+        sudo mkdir -p /mnt/armbian
 
-      # =========================
-      # 5. Compile Armbian rootfs
-      # =========================
-      - name: Build Armbian (Bookworm)
-        working-directory: /builder/build
-        run: |
-          chmod +x compile.sh
+        LOOP=$(sudo losetup -fP --show "$IMG")
+        echo "LOOP=$LOOP" >> $GITHUB_ENV
 
-          ./compile.sh \
-            RELEASE=bookworm \
-            BOARD=odroidn2 \
-            BRANCH=current \
-            BUILD_MINIMAL=no \
-            BUILD_DESKTOP=no \
-            KERNEL_CONFIGURE=no \
-            EXPERT=yes \
-            COMPRESS_OUTPUTIMAGE="sha"
+        sudo mount ${LOOP}p2 /mnt/armbian || sudo mount ${LOOP} /mnt/armbian
 
-      # =========================
-      # 6. Prepare output
-      # =========================
-      - name: Prepare output
-        run: |
-          mkdir -p release
-          cp -f /builder/build/output/images/*.img* release/
+    # =========================
+    # 7. Enter chroot prepare
+    # =========================
+    - name: Prepare chroot
+      run: |
+        sudo mount --bind /dev /mnt/armbian/dev
+        sudo mount --bind /proc /mnt/armbian/proc
+        sudo mount --bind /sys /mnt/armbian/sys
+        sudo cp /usr/bin/qemu-aarch64-static /mnt/armbian/usr/bin/
 
-      # =========================
-      # 7. Upload base image
-      # =========================
-      - name: Upload base image
-        uses: ophub/upload-to-releases@main
-        with:
-          tag: "HK1-Rbox-K8s-6.12.90"
-          artifacts: release/*
-          allow_updates: true
-          make_latest: true
-          gh_token: ${{ secrets.GITHUB_TOKEN }}
+    # =========================
+    # 8. Clone RTL8733BS driver
+    # =========================
+    - name: Get RTL8733BS driver
+      run: |
+        git clone https://github.com/xf110/rtl8733bs-20250521 driver
 
-      # =========================
-      # 8. Rebuild kernel (IMPORTANT)
-      # =========================
-      - name: Repack with ophub kernel 6.12.90
-        uses: ophub/amlogic-s9xxx-armbian@main
-        with:
-          build_target: armbian
-          armbian_path: release/*.img*
-          armbian_board: hk1-rbox-k8s
-          armbian_kernel: 6.12.90
-          auto_kernel: false
-          kernel_repo: ophub/kernel
-          kernel_usage: stable
-          armbian_fstype: ext4
-          builder_name: ophub
+    # =========================
+    # 9. Build driver inside image
+    # =========================
+    - name: Compile RTL8733BS
+      run: |
+        sudo chroot /mnt/armbian /bin/bash -c "
+          apt update &&
+          apt install -y build-essential bc dkms linux-headers-${KERNEL_VERSION}-current-meson64 || true
+        "
 
-      # =========================
-      # 9. Upload final image
-      # =========================
-      - name: Upload final image
-        uses: ophub/upload-to-releases@main
-        with:
-          tag: "HK1-Rbox-K8s-6.12.90"
-          artifacts: ${{ env.PACKAGED_OUTPUTPATH }}/*
-          allow_updates: true
-          make_latest: true
-          gh_token: ${{ secrets.GITHUB_TOKEN }}
-          body: |
-            ## HK1 Rbox K8s Armbian Image
+        sudo cp -r driver /mnt/armbian/root/
 
-            - Board: hk1-rbox-k8s
-            - Kernel: 6.12.90
-            - Release: bookworm
-            - Default user: root
-            - Default password: 1234
-            - Install: armbian-install
-            - Update: armbian-update
+        sudo chroot /mnt/armbian /bin/bash -c "
+          cd /root/driver &&
+          make clean || true &&
+          make -j$(nproc) KSRC=/lib/modules/${KERNEL_VERSION}-current-meson64/build
+        "
+
+    # =========================
+    # 10. Install module
+    # =========================
+    - name: Install driver
+      run: |
+        sudo chroot /mnt/armbian /bin/bash -c "
+          cd /root/driver &&
+          make install || true
+        "
+
+        sudo chroot /mnt/armbian /bin/bash -c "
+          depmod -a ${KERNEL_VERSION}-current-meson64
+        "
+
+        echo "8733bs" | sudo tee /mnt/armbian/etc/modules-load.d/rtl8733bs.conf
+
+    # =========================
+    # 11. Cleanup
+    # =========================
+    - name: Cleanup mount
+      run: |
+        sync
+        sudo umount /mnt/armbian/dev || true
+        sudo umount /mnt/armbian/proc || true
+        sudo umount /mnt/armbian/sys || true
+        sudo umount /mnt/armbian || true
+        sudo losetup -d $LOOP || true
+
+    # =========================
+    # 12. Upload image
+    # =========================
+    - name: Upload Release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: HK1-6.12.90-rtl8733bs
+        files: builder/build/output/images/*
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
